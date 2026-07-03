@@ -1,0 +1,10 @@
+# Grounding research (raw upstream dumps) — kept locally, not part of the submission
+.research/
+
+# Internal progress tracker — backstage notes, not part of the submission
+PROGRESS.md
+
+# Go build artifacts
+*.exe
+*.test
+*.out
