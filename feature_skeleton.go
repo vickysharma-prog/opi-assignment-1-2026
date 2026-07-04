@@ -9,16 +9,16 @@
 //	We add NVIDIA as a first-class vendor WITHOUT re-implementing offload, by splitting the
 //	work across three collaborating pieces, each owning the concern it actually fits:
 //
-//	  1. DPFProvisioner (SUB-OPERATOR concern) — owns the heavyweight, cluster-scoped,
+//	  1. DPFProvisioner (SUB-OPERATOR concern), owns the heavyweight, cluster-scoped,
 //	     asynchronous DPF lifecycle: install DPF, apply DPFOperatorConfig + DPUSet/BFB/DPUFlavor
 //	     to flash BlueField-3 and form the DPUCluster. This is minutes-long and CANNOT be
-//	     driven synchronously from the VSP's imperative Init() call — hence a separate piece.
+//	     driven synchronously from the VSP's imperative Init() call, hence a separate piece.
 //
-//	  2. NVIDIAVSP (ADAPTER concern) — implements the node-local surface the DPU Operator core
+//	  2. NVIDIAVSP (ADAPTER concern), implements the node-local surface the DPU Operator core
 //	     expects (device enumeration, VF count, per-NF calls) so NVIDIA is a first-class VSP.
 //	     It does NOT do provisioning; it verifies DPF is ready and delegates the datapath.
 //
-//	  3. ServiceChainTranslator (CRD-TRANSLATION concern) — a controller-runtime style
+//	  3. ServiceChainTranslator (CRD-TRANSLATION concern), a controller-runtime style
 //	     reconciler that maps DPU-Operator *intent* CRDs (ServiceFunctionChain, DpuNetwork)
 //	     into DPF CRDs (DPUServiceChain, DPUServiceInterface). Some mappings are lossy; the
 //	     lossy edges are called out in comments and in architecture_design.md.
@@ -182,12 +182,12 @@ func (i *DPUServiceInterface) GetName() string { return i.Name }
 var ErrDPFNotReady = errors.New("nvidiavsp: DPF provisioning not ready yet")
 
 // ---------------------------------------------------------------------------
-// 1. DPFProvisioner — SUB-OPERATOR concern: owns the cluster-scoped, async DPF lifecycle.
+// 1. DPFProvisioner, SUB-OPERATOR concern: owns the cluster-scoped, async DPF lifecycle.
 // ---------------------------------------------------------------------------
 
 // DPFProvisioner ensures DPF is installed and BlueField-3 is provisioned. This is deliberately
 // decoupled from the VSP's imperative Init() because BFB flashing + DPUCluster formation is a
-// long-running, declarative, cluster-scoped process — not something Init() can block on.
+// long-running, declarative, cluster-scoped process, not something Init() can block on.
 type DPFProvisioner struct {
 	Client       Client
 	BFBURL       string
@@ -226,7 +226,7 @@ func (p *DPFProvisioner) Ready(ctx context.Context) (bool, error) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. NVIDIAVSP — ADAPTER concern: the node-local VSP the DPU Operator core talks to.
+// 2. NVIDIAVSP, ADAPTER concern: the node-local VSP the DPU Operator core talks to.
 // ---------------------------------------------------------------------------
 
 // NVIDIAVSP implements the DPU Operator's VendorPlugin contract for NVIDIA BlueField.
@@ -284,7 +284,7 @@ func (v *NVIDIAVSP) SetDpuNetworkConfig(isAccelerated bool) error {
 }
 
 // ---------------------------------------------------------------------------
-// 3. ServiceChainTranslator — CRD-TRANSLATION concern: DPU-Operator intent -> DPF CRDs.
+// 3. ServiceChainTranslator, CRD-TRANSLATION concern: DPU-Operator intent -> DPF CRDs.
 // ---------------------------------------------------------------------------
 
 // ServiceChainTranslator reconciles DPU-Operator ServiceFunctionChain CRs into DPF
@@ -317,7 +317,7 @@ func (t *ServiceChainTranslator) Reconcile(ctx context.Context, req Request) (Re
 //     but SFC cannot express branch/multi-port topologies DPF supports (forward-lossy),
 //     and DPF chains that use non-linear topology cannot round-trip back to SFC (reverse-lossy).
 //   - SFC.NodeSelector (node labels) maps to DPUClusterSelector/ServiceChainSet NodeSelector,
-//     but the selection domains differ (host nodes vs DPU nodes) — see design doc.
+//     but the selection domains differ (host nodes vs DPU nodes), see design doc.
 func TranslateSFC(sfc *ServiceFunctionChain) *DPUServiceChain {
 	ports := make([]string, 0, len(sfc.NetworkFunctions))
 	for _, nf := range sfc.NetworkFunctions {

@@ -5,10 +5,11 @@
 **Date:** 2026-07-02
 **LLM used:** a general-purpose LLM assistant. Full prompt/response session in `llm_transcript.json`.
 
-> **How to read this doc:** §1–§2 establish the *real* current state of both operators (verified
+> **How to read this doc:** §1-§2 establish the *real* current state of both operators (verified
 > against source, not assumed). §3 states the core architectural finding. §4 is the proposed
 > design with sequence diagrams. §5 is the trade-off analysis (the heart of the assignment).
-> §6 covers mapping fidelity, §7 rejected alternatives, §8 risks. Assumptions: `ASSUMPTIONS.md`.
+> §6 covers mapping fidelity, §7 rejected alternatives, §8 resilience & edge cases (naive, failure,
+> fix), §9 open questions. Assumptions: `ASSUMPTIONS.md`.
 
 ---
 
@@ -22,7 +23,7 @@ Framework**, `github.com/nvidia/doca-platform`) which provisions BlueField-3 and
 accelerated OVN-Kubernetes datapath offloaded to the DPU.
 
 **Goal:** design an architecture that brings NVIDIA BlueField support into the unified OPI
-operator ecosystem **while maximizing reuse of the existing DPF operator** i.e. NVIDIA should
+operator ecosystem **while maximizing reuse of the existing DPF operator**, i.e. NVIDIA should
 become a first-class DPU-Operator vendor *without* re-implementing provisioning or offload that
 DPF already does well.
 
@@ -51,11 +52,20 @@ type VendorPlugin interface {
 ```
 
 The wire contract (`dpu-api/api.proto`, package `Vendor`) exposes:
-`LifeCycleService.Init(dpu_mode, dpu_identifier) → IpPort`, `DeviceService` (GetDevices /
+`LifeCycleService.Init(dpu_mode, dpu_identifier) -> IpPort`, `DeviceService` (GetDevices /
 SetNumVfs), `NetworkFunctionService` (Create/DeleteNetworkFunction), `DpuNetworkConfigService`
-(SetDpuNetworkConfig), `HeartbeatService.Ping`, and — notably — the **OPI EVPN-GW
+(SetDpuNetworkConfig), `HeartbeatService.Ping`, and, notably, the **OPI EVPN-GW
 `BridgePortService`** (`github.com/opiproject/opi-api`). So the seam is itself partly built on
 OPI's own vendor-neutral API.
+
+**Where a vendor is registered.** The concrete plug-in point is the detector registry in
+`internal/platform/vendordetector.go`: `NewDpuDetectorManager` holds a `detectors []VendorDetector`
+list (today `NewIntelDetector()`, `NewMarvellDetector()`, and a literal `// add more detectors here`),
+and each `VendorDetector` implements `IsDpuPlatform`, `IsDPU` (claim a PCI device), and
+`VspPlugin(dpuMode, imageManager, client, pm, dpuIdentifier) (*plugin.GrpcPlugin, error)` (hand back
+the gRPC plugin the daemon drives). **NVIDIA enters at exactly this line**: a new
+`NvidiaBlueField3Detector` whose `VspPlugin` returns our adapter. This is the single, minimal,
+core-side edit the design requires; everything else is new, out-of-tree code.
 
 **User-facing CRDs** (`api/v1`): `DpuOperatorConfig` (cluster-scoped, minimal spec),
 `DataProcessingUnit`, `DpuNetwork`, and `ServiceFunctionChain` (an ordered list of
@@ -74,7 +84,7 @@ DPF is a full operator with rich, **cluster-scoped, declarative** CRDs:
 | `provisioning.dpu.nvidia.com` | `BFB`, `DPUFlavor`, `DPUSet`, `DPU`, `DPUCluster` | Flash BlueField bootstream, define VF/SF flavor, provision DPUs, form the DPU cluster |
 | `svc.dpu.nvidia.com` | `DPUService`, `DPUServiceChain`, `DPUServiceInterface`, `DPUServiceIPAM`, `DPUServiceNAD`, `DPUDeployment` | Deploy services onto DPUs; wire the accelerated-OVN datapath and service chains |
 
-**Characterization:** DPF is **cluster-scoped, declarative, and asynchronous** provisioning a
+**Characterization:** DPF is **cluster-scoped, declarative, and asynchronous**: provisioning a
 BF3 (BFB flash + `DPUCluster` formation) is a **minutes-long** reconcile, not a synchronous call.
 
 ---
@@ -83,15 +93,15 @@ BF3 (BFB flash + `DPUCluster` formation) is a **minutes-long** reconcile, not a 
 
 > **A pure VSP adapter is necessary but NOT sufficient to "maximize DPF reuse."**
 
-The decisive axis is **scope**: the VSP seam is **per-node** the operator dials one plugin per
+The decisive axis is **scope**: the VSP seam is **per-node**, the operator dials one plugin per
 node over a unix socket to manage that node's local hardware (`GetDevices`, `SetNumVfs`,
-`CreateNetworkFunction`). DPF's most valuable capability provisioning BlueField-3 (flash BFB,
-form a `DPUCluster`) and standing up the offloaded OVN datapath is inherently **cluster-scoped
+`CreateNetworkFunction`). DPF's most valuable capability, provisioning BlueField-3 (flash BFB,
+form a `DPUCluster`) and standing up the offloaded OVN datapath, is inherently **cluster-scoped
 and declarative**: it is driven by cluster CRDs and reconciled asynchronously over minutes.
 
 A per-node imperative plugin is the wrong *shape* to own a cluster-scoped, long-running,
 declarative lifecycle. (The operator's real `Start()` even has an init retry loop, so slow init
-alone isn't the blocker the mismatch is scope and lifecycle, not just latency.) If we force all
+alone isn't the blocker: the mismatch is scope and lifecycle, not just latency.) If we force all
 of DPF through the per-node VSP straw, we bottleneck exactly the capability we came to reuse.
 Therefore the integration must **split responsibilities by concern**, and be explicit about the
 boundary. That split is the design.
@@ -106,7 +116,7 @@ Three collaborating components, each mapped to the **one** integration pattern i
 |---|---|---|
 | **DPF Provisioner** | **Sub-operator** | Install DPF; own `DPFOperatorConfig` + `DPUSet`/`BFB`/`DPUFlavor` lifecycle (cluster-scoped, async). |
 | **NVIDIA VSP** | **Adapter** | Implement the node-local VSP gRPC contract (device enum, VF count, NF wiring) so NVIDIA is a first-class vendor. Does **no** provisioning; verifies DPF readiness. |
-| **ServiceChain Translator** | **CRD-translation** | Reconcile DPU-Operator intent CRDs (`ServiceFunctionChain`, `DpuNetwork`) → DPF CRDs (`DPUServiceChain`, `DPUServiceInterface`). |
+| **ServiceChain Translator** | **CRD-translation** | Reconcile DPU-Operator intent CRDs (`ServiceFunctionChain`, `DpuNetwork`) -> DPF CRDs (`DPUServiceChain`, `DPUServiceInterface`). |
 
 A compilable skeleton of all three is in `feature_skeleton.go`.
 
@@ -122,7 +132,7 @@ flowchart TB
 
     subgraph NV["NVIDIA integration (new, this design)"]
         SUBOP["DPF Provisioner<br/><b>(sub-operator)</b>"]
-        VSP["NVIDIA VSP<br/><b>(adapter — gRPC/unix socket)</b>"]
+        VSP["NVIDIA VSP<br/><b>(adapter, gRPC/unix socket)</b>"]
         XLAT["ServiceChain Translator<br/><b>(CRD-translation reconciler)</b>"]
     end
 
@@ -164,7 +174,7 @@ sequenceDiagram
     DPF->>BF3: flash BFB bootstream
     BF3-->>DPF: DPU provisioned
     DPF->>DPF: form DPUCluster (accelerated OVN)
-    Note over SubOp,DPF: minutes-long, declarative, async —<br/>tracked via DPFOperatorConfig Ready condition + DPU/DPUSet status, NOT a blocking Init()
+    Note over SubOp,DPF: minutes-long, declarative, async, <br/>tracked via DPFOperatorConfig Ready condition + DPU/DPUSet status, NOT a blocking Init()
     DPF-->>SubOp: DPFOperatorConfig Ready + DPUs provisioned
     SubOp-->>OPI: condition Ready=true
 ```
@@ -185,7 +195,7 @@ sequenceDiagram
 
     Daemon->>VSP: Init(dpuMode, dpuIdentifier)  [gRPC/unix]
     VSP->>Prov: Ready()?
-    Prov-->>VSP: not ready → ErrDPFNotReady
+    Prov-->>VSP: not ready -> ErrDPFNotReady
     Daemon->>VSP: Init retry (matches real Init retry loop)
     VSP->>Prov: Ready()?
     Prov-->>VSP: ready
@@ -196,7 +206,7 @@ sequenceDiagram
 
     Note over Daemon,DPF: User applies a ServiceFunctionChain CR
     Daemon->>XLAT: (watch) ServiceFunctionChain event
-    XLAT->>XLAT: TranslateSFC(sfc) → DPUServiceChain
+    XLAT->>XLAT: TranslateSFC(sfc) -> DPUServiceChain
     XLAT->>DPF: apply DPUServiceChain + DPUServiceInterface
     DPF->>BF3: program offloaded flows (OVS-DOCA)
     BF3-->>DPF: chain active
@@ -212,10 +222,10 @@ assigns each pattern to a single concern instead of picking one globally.
 
 | Pattern | What it carries well | What it **cannot** carry | Verdict |
 |---|---|---|---|
-| **Pure Adapter** (NVIDIA VSP only) | Node-local device enum, VF count, per-NF wiring; makes NVIDIA a first-class vendor with **zero core changes**. | Cannot express DPF's cluster-scoped, **async minutes-long** provisioning through synchronous `Init()`; bottlenecks full OVN offload. | **Use — but only for the node-local surface.** |
+| **Pure Adapter** (NVIDIA VSP only) | Node-local device enum, VF count, per-NF wiring; makes NVIDIA a first-class vendor with **zero core changes**. | Cannot express DPF's cluster-scoped, **async minutes-long** provisioning through synchronous `Init()`; bottlenecks full OVN offload. | **Use, but only for the node-local surface.** |
 | **Sub-operator** (OPI installs & owns DPF) | Cluster-scoped, async **provisioning lifecycle** (DPFOperatorConfig/DPUSet/BFB); maximal DPF reuse. | Overkill and wrong shape for the fast, per-node imperative calls; duplicates VF plumbing if used for everything. | **Use but only for the DPF lifecycle.** |
-| **Pure CRD-translation** (standalone controller, no VSP) | Clean declarative mapping of intent CRDs → DPF CRDs. | Bypasses the operator's existing VSP/device plumbing → NVIDIA is **not** a real vendor; parallel, inconsistent path. | **Use but only for intent→DPF CRD mapping.** |
-| **Hybrid (this design)** | Each concern handled by its best-fit pattern; DPF reused wholesale; core essentially unchanged. | More moving parts; must define the boundary crisply (done in §3–§4). | **Selected.** |
+| **Pure CRD-translation** (standalone controller, no VSP) | Clean declarative mapping of intent CRDs -> DPF CRDs. | Bypasses the operator's existing VSP/device plumbing -> NVIDIA is **not** a real vendor; parallel, inconsistent path. | **Use but only for intent->DPF CRD mapping.** |
+| **Hybrid (this design)** | Each concern handled by its best-fit pattern; DPF reused wholesale; core essentially unchanged. | More moving parts; must define the boundary crisply (done in §3-§4). | **Selected.** |
 
 **Why "maximize reuse of DPF" points to the hybrid:** the sub-operator delegates *all* of
 provisioning and datapath offload to DPF (no re-implementation); the translator only re-expresses
@@ -231,7 +241,7 @@ comments so implementers see it).
 | OPI DPU-Operator surface | DPF target | Fidelity |
 |---|---|---|
 | `DpuOperatorConfig` (vendor=nvidia) | `DPFOperatorConfig` + `DPUSet` | **1:N** one intent expands into DPF install + provisioning set. |
-| `ServiceFunctionChain` (flat `{name,image}` list) | `DPUServiceChain` (ServiceChainSet template of ports/interfaces) | **Forward-lossy** — a linear chain synthesizes cleanly, but SFC cannot express DPF's branch/multi-port topologies; **reverse-lossy** non-linear DPF chains don't round-trip to SFC. |
+| `ServiceFunctionChain` (flat `{name,image}` list) | `DPUServiceChain` (ServiceChainSet template of ports/interfaces) | **Forward-lossy**, a linear chain synthesizes cleanly, but SFC cannot express DPF's branch/multi-port topologies; **reverse-lossy** non-linear DPF chains don't round-trip to SFC. |
 | `SFC.NodeSelector` (host node labels) | `DPUServiceChain.DPUClusterSelector` / ServiceChainSet `NodeSelector` | **Semantic shift** selection domain is *host nodes* vs *DPU nodes*; needs a documented mapping convention. |
 | `SetNumVfs(n)` (imperative) | `DPUFlavor` VF config (declarative) | **Model shift** imperative call becomes a declarative patch; effective on next DPF reconcile, not instantly. |
 | `CreateNetworkFunction(in,out,bridge)` / `CreateBridgePort` (OPI EVPN-GW) | `DPUServiceInterface` / `DPUServiceNAD` | Structural but mostly 1:1 per interface. |
@@ -250,20 +260,112 @@ comments so implementers see it).
 
 ---
 
-## 8. Risks & open questions
+## 8. Resilience & edge cases
 
-1. **DPUFlavor ↔ SetNumVfs semantics** imperative→declarative timing; needs a readiness gate so
-   the daemon doesn't assume VFs exist before DPF reconciles.
-2. **SFC topology expressiveness** if SFC must express DPF's richer chains, propose upstreaming a
-   richer SFC schema rather than overloading the lossy mapping.
-3. **Two reconcile domains** (host cluster vs DPU cluster) the translator must target the correct
-   `DPUCluster`; selector conventions must be defined.
-4. **Ownership/finalizers** sub-operator must not delete a user-managed DPF install; use
-   `helm.sh/resource-policy=keep`-style guards (DPF already annotates some CRDs this way).
+The boundary in §3 is where this design lives or dies, so each failure mode below follows the same
+discipline (naive behavior, then failure, then structural fix), and each is specific to the *hybrid*
+(a synchronous per-node VSP alongside an async cluster-scoped sub-operator), not generic operator
+hygiene.
+
+### 8.1 VSP `Init()` races ahead of DPF provisioning
+- **Naive:** `Init()` returns an `IpPort` as soon as the plugin process is up.
+- **Failure:** The node daemon proceeds to `GetDevices`/`CreateNetworkFunction` before DPF has
+  flashed the BFB and formed the `DPUCluster`, so VFs and offloaded ports don't exist yet and wiring
+  fails, or worse half-succeeds.
+- **Fix:** `Init()` gates on the sub-operator's readiness view (`DPFOperatorConfig` Ready *and* the
+  target `DPU` provisioned) and returns `ErrDPFNotReady` until then. This is safe precisely because
+  the operator's real `Start()`/`Init` path already retries, so the design leans on existing
+  behavior instead of inventing a new wait. (Shown in §4.3.)
+
+### 8.2 Sub-operator deletes a DPF the admin installed independently
+- **Naive:** The sub-operator owns `DPFOperatorConfig`; deleting the `DpuOperatorConfig` cascades and
+  tears DPF down.
+- **Failure:** An operator who ran DPF standalone before adopting OPI loses their whole DPF install
+  (and any in-flight provisioning) on an unrelated OPI change.
+- **Fix:** **Adopt, don't own.** The sub-operator manages only objects it created (stamped with its
+  own `app.kubernetes.io/managed-by` label) and honors a `helm.sh/resource-policy: keep`-style guard
+  on pre-existing DPF resources, which DPF already annotates some of its objects with. A pre-existing
+  DPF install is referenced, never deleted.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Admin as Cluster Admin
+    participant OPI as OPI DPU Operator core
+    participant SubOp as DPF Provisioner (sub-operator)
+    participant DPF as DPF install
+
+    Admin->>OPI: delete DpuOperatorConfig (vendor: nvidia)
+    OPI->>SubOp: reconcile deletion
+    SubOp->>SubOp: list DPF objects, check managed-by label
+    alt object created by sub-operator
+        SubOp->>DPF: delete owned DPUSet / BFB / DPUFlavor
+    else pre-existing (admin-installed) or resource-policy=keep
+        SubOp->>SubOp: skip; leave admin's DPF untouched
+    end
+    SubOp-->>OPI: deletion complete, no user data destroyed
+```
+
+### 8.3 Split-brain writes on the `svc.dpu.nvidia.com` CRDs
+- **Naive:** Both the VSP adapter (per-NF wiring) and the ServiceChain Translator can touch
+  `DPUServiceInterface`/`DPUServiceChain`.
+- **Failure:** Two writers race on `resourceVersion`; conflicting server-side-apply patches flap the
+  chain definition.
+- **Fix:** **One writer per API group.** The Translator is the *sole* writer of `svc.dpu.nvidia.com`
+  objects (SSA with a stable field-manager name); the VSP is read-only with respect to cluster CRDs
+  and confines itself to the node-local gRPC surface. RBAC enforces the split structurally.
+
+### 8.4 Bidirectional CRD version skew (OPI *and* DPF evolve independently)
+- **Naive:** The Translator is typed against one `ServiceFunctionChain` version and one
+  `DPUServiceChain` version, fixed at compile time.
+- **Failure:** OPI is itself an evolving LF standard (`v1alpha1` to `v1beta1` to `v1`) and DPF ships
+  on its own cadence. When either bumps a served version, the Translator silently drops unknown
+  fields (intent accepted by the API server but never acted on) or its watch breaks outright
+  (`410 Gone`).
+- **Fix:** API discovery against *both* CRD sets at startup and on any `CustomResourceDefinition`
+  change; a translation profile keyed on the **pair** `(OPI version, DPF version)`. If the served
+  pair has no profile, the Translator refuses to write malformed CRs and surfaces an
+  `UnsupportedVersion` condition (plus an Event on its own Deployment, since it may be unable to write
+  status on a schema it no longer understands) rather than failing silently.
+
+### 8.5 `SetNumVfs` (imperative) vs `DPUFlavor` (declarative) timing
+- **Naive:** `SetNumVfs(n)` patches the `DPUFlavor` and returns success immediately.
+- **Failure:** The daemon assumes *n* VFs exist and enumerates them before DPF's next reconcile has
+  materialized them, a VF-not-found race.
+- **Fix:** `SetNumVfs` patches the flavor and returns a **pending** result until DPF's `DPU`/`DPUSet`
+  status reflects the new VF count; the daemon's existing retry absorbs the gap. The imperative-to-
+  declarative seam is made explicit rather than papered over.
+
+### 8.6 Wrong reconcile domain (host cluster vs DPU tenant cluster)
+- **Naive:** The Translator applies `DPUServiceChain` into whatever cluster it happens to be watching.
+- **Failure:** In DPF's two-cluster topology the chain lands in the host cluster instead of the DPU
+  tenant cluster (or the wrong `DPUCluster`), so nothing programs on the BlueField.
+- **Fix:** A required, documented `DPUCluster`-selection convention derived from the SFC's
+  `NodeSelector` (the §6 semantic-shift mapping); if the target `DPUCluster` is ambiguous the
+  Translator refuses and sets a `TargetClusterUnresolved` condition rather than guessing.
+
+### 8.7 HA / concurrent reconcilers
+- **Naive:** Run two sub-operator or Translator replicas for availability, both reconciling.
+- **Failure:** Duplicate `DPUSet` creates or divergent patches during a rolling upgrade.
+- **Fix:** `controller-runtime` leader election (`Lease`); only the leader reconciles. Combined with
+  §8.3's single-writer rule and idempotent full-desired-set SSA every pass, a pod eviction mid-fan-out
+  self-heals on the next reconcile rather than orphaning a partial `DPFOperatorConfig`-then-`DPUSet`
+  sequence.
 
 ---
 
-## 9. Assumptions
+## 9. Open questions
+
+1. **SFC topology expressiveness:** if SFC must express DPF's richer branch/multi-port chains,
+   propose upstreaming a richer `ServiceFunctionChain` schema rather than overloading the §6 lossy
+   mapping indefinitely.
+2. **Zero-Trust vs Host-Trusted mode:** DPF's trust mode decides whether host or DPU owns the control
+   plane; the sub-operator must pick a default and expose it, as it changes who may write the
+   tenant-cluster kubeconfig the Translator uses.
+
+---
+
+## 10. Assumptions
 
 Summarized here; full list in `ASSUMPTIONS.md` (per the assignment's "make a reasonable assumption
 and document it" rule):
