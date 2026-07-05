@@ -60,7 +60,7 @@ OPI's own vendor-neutral API.
 
 **Where a vendor is registered.** The concrete plug-in point is the detector registry in
 `internal/platform/vendordetector.go`: `NewDpuDetectorManager` holds a `detectors []VendorDetector`
-list (today `NewIntelDetector()`, `NewMarvellDetector()`, and a literal `// add more detectors here`),
+list (today `NewIntelDetector()`, `NewMarvellDetector()`, `NewNetsecAcceleratorDetector()`, and a literal `// add more detectors here`),
 and each `VendorDetector` implements `IsDpuPlatform`, `IsDPU` (claim a PCI device), and
 `VspPlugin(dpuMode, imageManager, client, pm, dpuIdentifier) (*plugin.GrpcPlugin, error)` (hand back
 the gRPC plugin the daemon drives). **NVIDIA enters at exactly this line**: a new
@@ -244,7 +244,7 @@ comments so implementers see it).
 | `ServiceFunctionChain` (flat `{name,image}` list) | `DPUServiceChain` (ServiceChainSet template of ports/interfaces) | **Forward-lossy**, a linear chain synthesizes cleanly, but SFC cannot express DPF's branch/multi-port topologies; **reverse-lossy** non-linear DPF chains don't round-trip to SFC. |
 | `SFC.NodeSelector` (host node labels) | `DPUServiceChain.DPUClusterSelector` / ServiceChainSet `NodeSelector` | **Semantic shift** selection domain is *host nodes* vs *DPU nodes*; needs a documented mapping convention. |
 | `SetNumVfs(n)` (imperative) | `DPUFlavor` VF config (declarative) | **Model shift** imperative call becomes a declarative patch; effective on next DPF reconcile, not instantly. |
-| `CreateNetworkFunction(in,out,bridge)` / `CreateBridgePort` (OPI EVPN-GW) | `DPUServiceInterface` / `DPUServiceNAD` | Structural but mostly 1:1 per interface. |
+| `CreateNetworkFunction(in,out,bridge)` / `CreateBridgePort` (OPI EVPN-GW) | `DPUServiceInterface` / `DPUServiceNAD` | Structurally mostly 1:1 per interface, but the **imperative call vs. the eventually-reconciled apply** is a timing seam (see §8.5 and §9 Q3). |
 
 ---
 
@@ -352,6 +352,31 @@ sequenceDiagram
   self-heals on the next reconcile rather than orphaning a partial `DPFOperatorConfig`-then-`DPUSet`
   sequence.
 
+### 8.8 Finalizer deadlock, DPF operator uninstalled before the OPI config is deleted
+- **Naive:** The sub-operator's finalizer waits for the DPF children it created (`DPUSet`/`BFB`/
+  `DPUFlavor`) to be fully gone before it releases the `DpuOperatorConfig`.
+- **Failure:** An admin uninstalls the DPF operator while those children still exist. The sub-operator
+  issues `Delete`, but the children carry **DPF's own** finalizers and no DPF controller is left to
+  remove them, so they sit in `Terminating` forever, and the sub-operator's finalizer never releases.
+  The whole OPI management plane for that node group deadlocks, exactly the `kubectl`-surgery-on-live-
+  finalizers situation this design exists to avoid.
+- **Fix:** A bounded timeout on `deletionTimestamp` age **plus** a DPF-liveness probe (absence of the
+  DPF `Deployment`/leader `Lease`). Past the timeout *and* with DPF confirmed absent, the sub-operator
+  surfaces a visible `DPFOperatorUnresponsive` condition (never a silent hang) and blocks on an
+  explicit human `opi.io/force-cleanup: "true"` annotation before it strips finalizers, and only from
+  objects **it created** (the §8.2 "adopt, don't own" rule means an admin's pre-existing DPF install is
+  never touched). The strip is emitted as a high-severity Event, and never happens automatically.
+
+### 8.9 Reconcile storm at fleet scale
+- **Naive:** A `DpuOperatorConfig` targeting thousands of nodes fans out `DPUSet`/provisioning objects
+  in one unthrottled burst.
+- **Failure:** The simultaneous API writes saturate the API server and DPF's own workqueue, degrading
+  the very provisioning the design came to reuse.
+- **Fix:** A rate-limited sub-operator workqueue, and **delegate per-device rollout throttling to DPF's
+  own** `DPUSet` `rollingUpdate.maxUnavailable` rather than re-implementing it, consistent with the
+  design's rule that DPF does the heavy lifting (§5). The sub-operator applies the full desired
+  `DPUSet` once; DPF paces the actual flashing.
+
 ---
 
 ## 9. Open questions
@@ -362,6 +387,17 @@ sequenceDiagram
 2. **Zero-Trust vs Host-Trusted mode:** DPF's trust mode decides whether host or DPU owns the control
    plane; the sub-operator must pick a default and expose it, as it changes who may write the
    tenant-cluster kubeconfig the Translator uses.
+3. **Synchronous VSP call vs asynchronous DPF apply (the runtime face of §3):** the VSP contract is
+   imperative and synchronous, e.g. `CreateBridgePort` must *return* a populated `*opi.BridgePort`,
+   while the adapter satisfies it by applying a declarative DPF `DPUServiceInterface`/`DPUServiceNAD`
+   that DPF reconciles eventually. The design already resolves this seam for `SetNumVfs` (§8.5: return
+   *pending* until DPF status catches up), so the open question is whether *every* node-local VSP call
+   can be expressed as "apply a DPF CRD, report pending until reconciled," or whether a small number of
+   calls that need a synchronous result warrant a node-local DOCA control surface. Note this is a
+   deliberate strength, not a gap: routing through DPF's own CRDs reuses DPF wholesale instead of
+   assuming an unverified local DOCA API, at the cost of making the imperative→declarative timing
+   (§8.5) load-bearing, which should be validated against `DPUServiceInterface`'s actual status
+   semantics before implementation.
 
 ---
 
