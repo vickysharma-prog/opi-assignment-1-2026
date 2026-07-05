@@ -195,7 +195,7 @@ sequenceDiagram
 
     Daemon->>VSP: Init(dpuMode, dpuIdentifier)  [gRPC/unix]
     VSP->>Prov: Ready()?
-    Prov-->>VSP: not ready -> ErrDPFNotReady
+    Prov-->>VSP: not ready, returns ErrDPFNotReady
     Daemon->>VSP: Init retry (matches real Init retry loop)
     VSP->>Prov: Ready()?
     Prov-->>VSP: ready
@@ -206,7 +206,7 @@ sequenceDiagram
 
     Note over Daemon,DPF: User applies a ServiceFunctionChain CR
     Daemon->>XLAT: (watch) ServiceFunctionChain event
-    XLAT->>XLAT: TranslateSFC(sfc) -> DPUServiceChain
+    XLAT->>XLAT: TranslateSFC(sfc) to DPUServiceChain
     XLAT->>DPF: apply DPUServiceChain + DPUServiceInterface
     DPF->>BF3: program offloaded flows (OVS-DOCA)
     BF3-->>DPF: chain active
@@ -295,15 +295,15 @@ sequenceDiagram
     participant SubOp as DPF Provisioner (sub-operator)
     participant DPF as DPF install
 
-    Admin->>OPI: delete DpuOperatorConfig (vendor: nvidia)
+    Admin->>OPI: delete DpuOperatorConfig
     OPI->>SubOp: reconcile deletion
-    SubOp->>SubOp: list DPF objects, check managed-by label
-    alt object created by sub-operator
-        SubOp->>DPF: delete owned DPUSet / BFB / DPUFlavor
-    else pre-existing (admin-installed) or resource-policy=keep
-        SubOp->>SubOp: skip; leave admin's DPF untouched
+    SubOp->>SubOp: list DPF objects and check managed-by label
+    alt object was created by the sub-operator
+        SubOp->>DPF: delete owned DPUSet, BFB and DPUFlavor
+    else pre-existing or marked resource-policy keep
+        SubOp->>SubOp: skip and leave the admin DPF untouched
     end
-    SubOp-->>OPI: deletion complete, no user data destroyed
+    SubOp-->>OPI: deletion complete and no user data destroyed
 ```
 
 ### 8.3 Split-brain writes on the `svc.dpu.nvidia.com` CRDs
